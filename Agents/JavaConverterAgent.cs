@@ -39,6 +39,25 @@ public class JavaConverterAgent : AgentBase, IJavaConverterAgent, ICodeConverter
     }
 
     /// <summary>
+    /// Creates a JavaConverterAgent, routing to Responses API or Chat API based on availability.
+    /// </summary>
+    public static JavaConverterAgent Create(
+        ResponsesApiClient? responsesClient,
+        IChatClient? chatClient,
+        ILogger<JavaConverterAgent> logger,
+        string modelId,
+        EnhancedLogger? enhancedLogger = null,
+        ChatLogger? chatLogger = null,
+        RateLimiter? rateLimiter = null,
+        AppSettings? settings = null,
+        int? runId = null)
+    {
+        return responsesClient != null
+            ? new JavaConverterAgent(responsesClient, logger, modelId, enhancedLogger, chatLogger, rateLimiter, settings, runId)
+            : new JavaConverterAgent(chatClient!, logger, modelId, enhancedLogger, chatLogger, rateLimiter, settings, runId);
+    }
+
+    /// <summary>
     /// Initializes a new instance using Responses API (for codex models like gpt-5.1-codex-mini).
     /// </summary>
     public JavaConverterAgent(

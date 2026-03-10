@@ -39,6 +39,26 @@ public class ChunkAwareCSharpConverter : AgentBase, IChunkAwareConverter
     }
 
     /// <summary>
+    /// Creates a ChunkAwareCSharpConverter, routing to Responses API or Chat API based on availability.
+    /// </summary>
+    public static ChunkAwareCSharpConverter Create(
+        ResponsesApiClient? responsesClient,
+        IChatClient? chatClient,
+        ILogger<ChunkAwareCSharpConverter> logger,
+        string modelId,
+        ConversionSettings conversionSettings,
+        EnhancedLogger? enhancedLogger = null,
+        ChatLogger? chatLogger = null,
+        RateLimiter? rateLimiter = null,
+        AppSettings? settings = null,
+        int? runId = null)
+    {
+        return responsesClient != null
+            ? new ChunkAwareCSharpConverter(responsesClient, logger, modelId, conversionSettings, enhancedLogger, chatLogger, rateLimiter, settings, runId)
+            : new ChunkAwareCSharpConverter(chatClient!, logger, modelId, conversionSettings, enhancedLogger, chatLogger, rateLimiter, settings, runId);
+    }
+
+    /// <summary>
     /// Initializes a new instance using Responses API (for codex models like gpt-5.1-codex-mini).
     /// </summary>
     public ChunkAwareCSharpConverter(

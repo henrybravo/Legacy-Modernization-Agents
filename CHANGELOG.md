@@ -5,6 +5,24 @@ All notable changes to this repository are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.0] - 2026-03-09
+
+### Added
+- **GitHub Copilot SDK Provider** — New `ServiceType=GitHubCopilot` option uses the `GitHub.Copilot.SDK` NuGet package and `CopilotChatClient` as an alternative to Azure OpenAI. All agents fall back to `IChatClient` when `ResponsesApiClient` is unavailable. Configuration requires only `AISETTINGS__MODELID`; endpoint and API key are ignored.
+- **`list-models` CLI Command** — `dotnet run -- list-models` enumerates models available to the authenticated GitHub Copilot user via the SDK.
+- **Interactive Provider Selection in `doctor.sh setup`** — Users choose between Azure OpenAI and GitHub Copilot SDK. The Copilot path verifies CLI presence, authenticates via `copilot login`, fetches available models, and writes `ai-config.local.env`.
+- **`CreateGitHubCopilotChatClient()` in `ChatClientFactory`** — Factory method for `CopilotChatClient`; `CreateChatClient()` accepts a `serviceType` parameter to route to the correct backend.
+
+### Changed
+- **`ResponsesApiClient` made nullable** — `MigrationProcess`, `ChunkedMigrationProcess`, and `SmartMigrationOrchestrator` accept `null` for the Responses API client. All agent construction is dual-pathed (Responses API vs `IChatClient`).
+- **Dynamic provider name in logging** — `AgentBase.ProviderName`, `CobolAnalyzerAgent.ProviderName`, and `ChatLogger` display "GitHub Copilot" or "Azure OpenAI" based on the active client type.
+- **`doctor.sh` diagnostics** — `check_ai_connectivity()`, `run_doctor()`, and `run_test()` detect `GitHubCopilot` service type, validate the Copilot CLI, and skip Azure-specific endpoint/deployment checks.
+- **`Config/load-config.sh`** — `validate_config()` short-circuits for `GitHubCopilot`, requiring only `AISETTINGS__MODELID`.
+- **Devcontainer** — Base image updated to `.NET 10.0`; installs `@github/copilot@latest` (Copilot CLI); adds `github-cli` feature; Node pinned to v22.
+
+### Fixed
+- **`generate_migration_report()` in `doctor.sh`** — Changed SQLite `.mode markdown` to `.mode list` to produce correct report output.
+
 ## [2.5.0] - 2026-02-23
 
 ### Added

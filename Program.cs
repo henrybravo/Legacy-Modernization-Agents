@@ -8,6 +8,7 @@ using CobolToQuarkusMigration.Mcp;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging;
 using System.CommandLine;
+using GitHub.Copilot.SDK;
 using Microsoft.Extensions.Logging.Console;
 
 namespace CobolToQuarkusMigration;
@@ -26,8 +27,8 @@ internal static class Program
         var logsDirectory = Path.Combine(Directory.GetCurrentDirectory(), "Logs");
         Directory.CreateDirectory(logsDirectory);
         
-        // Only enable live logging for migration runs (not MCP server or conversation modes)
-        var isMigrationRun = !args.Contains("mcp") && !args.Contains("conversation");
+        // Only enable live logging for migration runs (not MCP server, conversation, or utility modes)
+        var isMigrationRun = !args.Contains("mcp") && !args.Contains("conversation") && !args.Contains("list-models");
         LiveLogWriter? liveLogWriter = null;
         
         if (isMigrationRun)
@@ -44,12 +45,15 @@ internal static class Program
                 {
                     options.LogToStandardErrorThreshold = LogLevel.Trace;
                 });
+                // Suppress verbose Copilot SDK internal tracing
+                builder.AddFilter("GitHub.Copilot.SDK", LogLevel.Warning);
             });
             var logger = loggerFactory.CreateLogger(nameof(Program));
             var fileHelper = new FileHelper(loggerFactory.CreateLogger<FileHelper>());
             var settingsHelper = new SettingsHelper(loggerFactory.CreateLogger<SettingsHelper>());
 
-            if (!ValidateAndLoadConfiguration())
+            // list-models only needs the Copilot CLI, skip full config validation
+            if (!args.Contains("list-models") && !ValidateAndLoadConfiguration())
             {
                 return 1;
             }
@@ -136,12 +140,33 @@ internal static class Program
         var reverseEngineerCommand = BuildReverseEngineerCommand(loggerFactory, fileHelper, settingsHelper);
         rootCommand.AddCommand(reverseEngineerCommand);
 
+        var listModelsCommand = BuildListModelsCommand();
+        rootCommand.AddCommand(listModelsCommand);
+
         rootCommand.SetHandler(async (string cobolSource, string javaOutput, string reverseEngineerOutput, bool reverseEngineerOnly, bool skipReverseEngineering, bool reuseRe, string configPath, bool resume) =>
         {
             await RunMigrationAsync(loggerFactory, logger, fileHelper, settingsHelper, cobolSource, javaOutput, reverseEngineerOutput, reverseEngineerOnly, skipReverseEngineering, reuseRe, configPath, resume);
         }, cobolSourceOption, javaOutputOption, reverseEngineerOutputOption, reverseEngineerOnlyOption, skipReverseEngineeringOption, reuseReOption, configOption, resumeOption);
 
         return rootCommand;
+    }
+
+    private static Command BuildListModelsCommand()
+    {
+        var listModelsCommand = new Command("list-models", "List available GitHub Copilot models for the authenticated user");
+
+        listModelsCommand.SetHandler(async () =>
+        {
+            await using var client = new CopilotClient();
+            await client.StartAsync();
+            var models = await client.ListModelsAsync();
+            foreach (var model in models)
+            {
+                Console.WriteLine(model.Id);
+            }
+        });
+
+        return listModelsCommand;
     }
 
     private static Command BuildConversationCommand(ILoggerFactory loggerFactory)
@@ -351,40 +376,53 @@ internal static class Program
             // Get API version from environment or default
             var apiVersion = Environment.GetEnvironmentVariable("AZURE_OPENAI_API_VERSION") ?? "2025-04-01-preview";
 
+            // Validate AI settings before using them
+            var aiSettings = settings.AISettings;
+            if (aiSettings is null)
+            {
+                Console.Error.WriteLine("AI settings are not configured. Cannot initialize ResponsesApiClient.");
+                return;
+            }
+
             // Create ResponsesApiClient for code agents - Use same logic as RunMigrationAsync
             ResponsesApiClient? responsesApiClient = null;
-            if (!string.IsNullOrEmpty(settings.AISettings.Endpoint) && !string.IsNullOrEmpty(settings.AISettings.DeploymentName))
+            if (!IsGitHubCopilotMode(aiSettings) &&
+                !string.IsNullOrEmpty(aiSettings.Endpoint) && !string.IsNullOrEmpty(aiSettings.DeploymentName))
             {
                 // Force Entra ID (DefaultAzureCredential) by passing empty API Key as requested
                 responsesApiClient = new ResponsesApiClient(
-                    settings.AISettings.Endpoint,
+                    aiSettings.Endpoint,
                     string.Empty, // Forces DefaultAzureCredential
-                    settings.AISettings.DeploymentName,
+                    aiSettings.DeploymentName,
                     loggerFactory.CreateLogger<ResponsesApiClient>(),
                     enhancedLogger,
                     profile: settings.CodexProfile,
                     apiVersion: apiVersion,
                     rateLimitSafetyFactor: settings.ChunkingSettings.RateLimitSafetyFactor);
-                mcpLogger.LogInformation("ResponsesApiClient initialized for codex model: {DeploymentName} (Entra ID)", settings.AISettings.DeploymentName);
+                mcpLogger.LogInformation("ResponsesApiClient initialized for codex model: {DeploymentName} (Entra ID)", aiSettings.DeploymentName);
             }
 
             // Create IChatClient for MCP server
             IChatClient? chatClient = null;
-            var chatEndpoint = settings.AISettings?.ChatEndpoint ?? settings.AISettings?.Endpoint;
-            var chatApiKey = settings.AISettings?.ChatApiKey ?? settings.AISettings?.ApiKey;
-            var chatDeployment = settings.AISettings?.ChatDeploymentName ?? settings.AISettings?.ChatModelId ?? settings.AISettings?.DeploymentName;
+            var chatDeployment = aiSettings.ChatDeploymentName ?? aiSettings.ChatModelId ?? aiSettings.DeploymentName;
 
-            if (!string.IsNullOrEmpty(chatEndpoint) && !string.IsNullOrEmpty(chatDeployment))
+            if (IsGitHubCopilotMode(aiSettings))
             {
+                chatClient = CreateChatClientFromSettings(aiSettings, mcpLogger, forChat: true);
+            }
+            else if (!string.IsNullOrEmpty(aiSettings.ChatEndpoint ?? aiSettings.Endpoint) && !string.IsNullOrEmpty(chatDeployment))
+            {
+                var chatEndpoint = aiSettings.ChatEndpoint ?? aiSettings.Endpoint;
+                var chatApiKey = aiSettings.ChatApiKey ?? aiSettings.ApiKey;
                 bool useEntraId = string.IsNullOrEmpty(chatApiKey) || chatApiKey.Contains("your-api-key");
                 if (useEntraId)
                 {
-                    chatClient = ChatClientFactory.CreateAzureOpenAIChatClientWithDefaultCredential(chatEndpoint, chatDeployment);
+                    chatClient = ChatClientFactory.CreateAzureOpenAIChatClientWithDefaultCredential(chatEndpoint!, chatDeployment);
                     mcpLogger.LogInformation("IChatClient initialized for MCP server with deployment: {Deployment} (Entra ID)", chatDeployment);
                 }
                 else if (!string.IsNullOrEmpty(chatApiKey))
                 {
-                    chatClient = ChatClientFactory.CreateAzureOpenAIChatClient(chatEndpoint, chatApiKey, chatDeployment);
+                    chatClient = ChatClientFactory.CreateAzureOpenAIChatClient(chatEndpoint!, chatApiKey, chatDeployment);
                     mcpLogger.LogInformation("IChatClient initialized for MCP server with deployment: {Deployment} (API Key)", chatDeployment);
                 }
             }
@@ -405,6 +443,45 @@ internal static class Program
         {
             loggerFactory.CreateLogger(nameof(Program)).LogError(ex, "Error running MCP server");
             Environment.Exit(1);
+        }
+    }
+
+    private static bool IsGitHubCopilotMode(AISettings ai)
+        => string.Equals(ai.ServiceType, "GitHubCopilot", StringComparison.OrdinalIgnoreCase);
+
+    private static IChatClient CreateChatClientFromSettings(
+        AISettings ai,
+        ILogger logger,
+        bool forChat = true)
+    {
+        var endpoint  = forChat ? (ai.ChatEndpoint  ?? ai.Endpoint)        : ai.Endpoint;
+        var apiKey    = forChat ? (ai.ChatApiKey     ?? ai.ApiKey)          : ai.ApiKey;
+        var deployment = forChat ? (ai.ChatDeploymentName ?? ai.DeploymentName) : ai.DeploymentName;
+        var modelId   = forChat ? (ai.ChatModelId   ?? ai.ModelId)         : ai.ModelId;
+
+        if (IsGitHubCopilotMode(ai))
+        {
+            var ghToken = Environment.GetEnvironmentVariable("GITHUB_COPILOT_TOKEN");
+            var client = ChatClientFactory.CreateGitHubCopilotChatClient(
+                modelId ?? deployment,
+                githubToken: ghToken,
+                logger);
+            logger.LogInformation("IChatClient initialized via GitHub Copilot SDK for model: {Model}", modelId ?? deployment);
+            return client;
+        }
+
+        bool useEntraId = string.IsNullOrEmpty(apiKey) || apiKey.Contains("your-api-key");
+        if (useEntraId)
+        {
+            var client = ChatClientFactory.CreateAzureOpenAIChatClientWithDefaultCredential(endpoint, deployment);
+            logger.LogInformation("IChatClient initialized for model: {Deployment} (Entra ID)", deployment);
+            return client;
+        }
+        else
+        {
+            var client = ChatClientFactory.CreateAzureOpenAIChatClient(endpoint, apiKey, deployment);
+            logger.LogInformation("IChatClient initialized for model: {Deployment} (API Key)", deployment);
+            return client;
         }
     }
 
@@ -492,12 +569,16 @@ internal static class Program
                 }
             }
 
-            if (string.IsNullOrEmpty(settings.AISettings.Endpoint) ||
-                string.IsNullOrEmpty(settings.AISettings.DeploymentName))
+            // Validate required AI configuration (relaxed for GitHub Copilot SDK)
+            if (!IsGitHubCopilotMode(settings.AISettings))
             {
-                logger.LogError("Azure OpenAI configuration incomplete. Please ensure endpoint and deployment name are configured.");
-                logger.LogError("You can set them in Config/ai-config.local.env or as environment variables.");
-                Environment.Exit(1);
+                if (string.IsNullOrEmpty(settings.AISettings.Endpoint) ||
+                    string.IsNullOrEmpty(settings.AISettings.DeploymentName))
+                {
+                    logger.LogError("Azure OpenAI configuration incomplete. Please ensure endpoint and deployment name are configured.");
+                    logger.LogError("You can set them in Config/ai-config.local.env or as environment variables.");
+                    Environment.Exit(1);
+                }
             }
 
             if (string.IsNullOrEmpty(settings.AISettings.ModelId))
@@ -508,44 +589,31 @@ internal static class Program
 
             // Create EnhancedLogger early so it can track ALL API calls
             var enhancedLogger = new EnhancedLogger(loggerFactory.CreateLogger<EnhancedLogger>());
-            var chatLogger = new ChatLogger(loggerFactory.CreateLogger<ChatLogger>());
+            var providerName = IsGitHubCopilotMode(settings.AISettings) ? "GitHub Copilot" : "Azure OpenAI";
+            var chatLogger = new ChatLogger(loggerFactory.CreateLogger<ChatLogger>(), providerName: providerName);
 
             // Get API version from environment or default
             var apiVersion = Environment.GetEnvironmentVariable("AZURE_OPENAI_API_VERSION") ?? "2025-04-01-preview";
 
-            // Create ResponsesApiClient for code agents (codex model via Responses API)
-            // gpt-5.1-codex-mini uses Responses API at /openai/responses, NOT Chat Completions
-            var responsesApiClient = new ResponsesApiClient(
-                settings.AISettings.Endpoint,
-                string.Empty, // Forces DefaultAzureCredential
-                settings.AISettings.DeploymentName,
-                loggerFactory.CreateLogger<ResponsesApiClient>(),
-                enhancedLogger,
-                profile: settings.CodexProfile,
-                apiVersion: apiVersion,
-                rateLimitSafetyFactor: settings.ChunkingSettings.RateLimitSafetyFactor);  // Pass EnhancedLogger for API call tracking
+            ResponsesApiClient? responsesApiClient = null;
+            if (!IsGitHubCopilotMode(settings.AISettings))
+            {
+                responsesApiClient = new ResponsesApiClient(
+                    settings.AISettings.Endpoint,
+                    string.Empty, // Forces DefaultAzureCredential
+                    settings.AISettings.DeploymentName,
+                    loggerFactory.CreateLogger<ResponsesApiClient>(),
+                    enhancedLogger,
+                    profile: settings.CodexProfile,
+                    apiVersion: apiVersion,
+                    rateLimitSafetyFactor: settings.ChunkingSettings.RateLimitSafetyFactor);
 
-            logger.LogInformation("ResponsesApiClient initialized for codex model: {DeploymentName} (API: {ApiVersion}, Entra ID)", 
-                settings.AISettings.DeploymentName, apiVersion);
+                logger.LogInformation("ResponsesApiClient initialized for codex model: {DeploymentName} (API: {ApiVersion}, Entra ID)", 
+                    settings.AISettings.DeploymentName, apiVersion);
+            }
 
-            // Create IChatClient for chat agents (RE reports, chat via Chat Completions API)
-            var chatEndpoint = settings.AISettings.ChatEndpoint ?? settings.AISettings.Endpoint;
-            var chatApiKey = settings.AISettings.ChatApiKey ?? settings.AISettings.ApiKey;
             var chatDeployment = settings.AISettings.ChatDeploymentName ?? settings.AISettings.DeploymentName;
-
-            IChatClient chatClient;
-            bool useEntraId = string.IsNullOrEmpty(chatApiKey) || chatApiKey.Contains("your-api-key");
-            
-            if (useEntraId)
-            {
-                 chatClient = ChatClientFactory.CreateAzureOpenAIChatClientWithDefaultCredential(chatEndpoint, chatDeployment);
-                 logger.LogInformation("IChatClient initialized for chat model: {ChatDeployment} (Entra ID)", chatDeployment);
-            }
-            else
-            {
-                 chatClient = ChatClientFactory.CreateAzureOpenAIChatClient(chatEndpoint, chatApiKey, chatDeployment);
-                 logger.LogInformation("IChatClient initialized for chat model: {ChatDeployment} (API Key)", chatDeployment);
-            }
+            IChatClient chatClient = CreateChatClientFromSettings(settings.AISettings, logger, forChat: true);
 
             var databasePath = settings.ApplicationSettings.MigrationDatabasePath;
             if (!Path.IsPathRooted(databasePath))
@@ -609,34 +677,24 @@ internal static class Program
                     loggerFactory.CreateLogger<CobolToQuarkusMigration.Chunking.ChunkingOrchestrator>(),
                     targetLang);
 
-                // CobolAnalyzerAgent uses Responses API client (codex for code analysis)
-                var cobolAnalyzerAgent = new CobolAnalyzerAgent(
-                    responsesApiClient,
+                var cobolAnalyzerAgent = CobolAnalyzerAgent.Create(
+                    responsesApiClient, chatClient,
                     loggerFactory.CreateLogger<CobolAnalyzerAgent>(),
                     settings.AISettings.CobolAnalyzerModelId,
-                    enhancedLogger,
-                    chatLogger,
-                    settings: settings);
+                    enhancedLogger, chatLogger, settings: settings);
 
-                // BusinessLogicExtractorAgent uses ResponsesApiClient (codex for RE reports)
-                // This ensures compatibility with gpt-5.2-chat which requires Responses API
-                var businessLogicExtractorAgent = new BusinessLogicExtractorAgent(
-                    responsesApiClient,
+                var businessLogicExtractorAgent = BusinessLogicExtractorAgent.Create(
+                    responsesApiClient, chatClient,
                     loggerFactory.CreateLogger<BusinessLogicExtractorAgent>(),
                     chatDeployment,
-                    enhancedLogger,
-                    chatLogger,
-                    chunkingOrchestrator: chunkingOrchestrator,
-                    settings: settings);
+                    enhancedLogger, chatLogger,
+                    chunkingOrchestrator: chunkingOrchestrator, settings: settings);
 
-                // DependencyMapperAgent uses ResponsesApiClient (codex for dependency analysis)
-                var dependencyMapperAgent = new DependencyMapperAgent(
-                    responsesApiClient,
+                var dependencyMapperAgent = DependencyMapperAgent.Create(
+                    responsesApiClient, chatClient,
                     loggerFactory.CreateLogger<DependencyMapperAgent>(),
                     settings.AISettings.DependencyMapperModelId ?? settings.AISettings.CobolAnalyzerModelId,
-                    enhancedLogger,
-                    chatLogger,
-                    settings: settings);
+                    enhancedLogger, chatLogger, settings: settings);
 
                 // Smart routing: check for large files to decide between chunked vs direct RE
                 var cobolFiles = await fileHelper.ScanDirectoryForCobolFilesAsync(settings.ApplicationSettings.CobolSourceFolder);
@@ -1338,54 +1396,47 @@ internal static class Program
                 Environment.Exit(1);
             }
 
-            if (string.IsNullOrEmpty(settings.AISettings.Endpoint) ||
-                string.IsNullOrEmpty(settings.AISettings.DeploymentName))
+            // Validate required AI configuration (relaxed for GitHub Copilot SDK)
+            if (!IsGitHubCopilotMode(settings.AISettings))
             {
-                logger.LogError("Azure OpenAI configuration incomplete. Please ensure endpoint and deployment name are configured.");
-                Environment.Exit(1);
+                if (string.IsNullOrEmpty(settings.AISettings.Endpoint) ||
+                    string.IsNullOrEmpty(settings.AISettings.DeploymentName))
+                {
+                    logger.LogError("Azure OpenAI configuration incomplete. Please ensure endpoint and deployment name are configured.");
+                    Environment.Exit(1);
+                }
             }
 
             // Create EnhancedLogger and ChatLogger early for API tracking
             var enhancedLogger = new EnhancedLogger(
                 loggerFactory.CreateLogger<EnhancedLogger>());
+            var providerName = IsGitHubCopilotMode(settings.AISettings) ? "GitHub Copilot" : "Azure OpenAI";
             var chatLogger = new ChatLogger(
-                loggerFactory.CreateLogger<ChatLogger>());
+                loggerFactory.CreateLogger<ChatLogger>(), providerName: providerName);
 
             // Get API version from environment or default
             var apiVersion = Environment.GetEnvironmentVariable("AZURE_OPENAI_API_VERSION") ?? "2025-04-01-preview";
 
-            // Create ResponsesApiClient for code agents (codex models via Responses API)
-            var responsesApiClient = new ResponsesApiClient(
-                settings.AISettings.Endpoint,
-                string.Empty, // Forces DefaultAzureCredential
-                settings.AISettings.DeploymentName,
-                loggerFactory.CreateLogger<ResponsesApiClient>(),
-                enhancedLogger,
-                profile: settings.CodexProfile,
-                apiVersion: apiVersion,
-                rateLimitSafetyFactor: settings.ChunkingSettings.RateLimitSafetyFactor);
+            // Create ResponsesApiClient for code agents (Azure-only, null in Copilot SDK mode)
+            ResponsesApiClient? responsesApiClient = null;
+            if (!IsGitHubCopilotMode(settings.AISettings))
+            {
+                responsesApiClient = new ResponsesApiClient(
+                    settings.AISettings.Endpoint,
+                    string.Empty, // Forces DefaultAzureCredential
+                    settings.AISettings.DeploymentName,
+                    loggerFactory.CreateLogger<ResponsesApiClient>(),
+                    enhancedLogger,
+                    profile: settings.CodexProfile,
+                    apiVersion: apiVersion,
+                    rateLimitSafetyFactor: settings.ChunkingSettings.RateLimitSafetyFactor);
 
-            logger.LogInformation("ResponsesApiClient initialized for codex model: {DeploymentName} (API: {ApiVersion}, Entra ID)", 
-                settings.AISettings.DeploymentName, apiVersion);
+                logger.LogInformation("ResponsesApiClient initialized for codex model: {DeploymentName} (API: {ApiVersion}, Entra ID)", 
+                    settings.AISettings.DeploymentName, apiVersion);
+            }
 
-            // Create IChatClient for chat agents (RE reports via Chat Completions API)
-            var chatEndpoint = settings.AISettings.ChatEndpoint ?? settings.AISettings.Endpoint;
-            var chatApiKey = settings.AISettings.ChatApiKey ?? settings.AISettings.ApiKey;
             var chatDeployment = settings.AISettings.ChatDeploymentName ?? settings.AISettings.DeploymentName;
-
-            IChatClient chatClient;
-            bool useEntraId = string.IsNullOrEmpty(chatApiKey) || chatApiKey.Contains("your-api-key");
-
-            if (useEntraId)
-            {
-                chatClient = ChatClientFactory.CreateAzureOpenAIChatClientWithDefaultCredential(chatEndpoint, chatDeployment);
-                logger.LogInformation("IChatClient initialized for chat model: {ChatDeployment} (Entra ID)", chatDeployment);
-            }
-            else
-            {
-                chatClient = ChatClientFactory.CreateAzureOpenAIChatClient(chatEndpoint, chatApiKey, chatDeployment);
-                logger.LogInformation("IChatClient initialized for chat model: {ChatDeployment} (API Key)", chatDeployment);
-            }
+            IChatClient chatClient = CreateChatClientFromSettings(settings.AISettings, logger, forChat: true);
 
             ConfigureSmartChunking(settings, chatDeployment, logger);
 
@@ -1398,34 +1449,24 @@ internal static class Program
                 loggerFactory.CreateLogger<CobolToQuarkusMigration.Chunking.ChunkingOrchestrator>(),
                 targetLang);
 
-            // CobolAnalyzerAgent uses ResponsesApiClient (codex for code analysis)
-            var cobolAnalyzerAgent = new CobolAnalyzerAgent(
-                responsesApiClient,
+            var cobolAnalyzerAgent = CobolAnalyzerAgent.Create(
+                responsesApiClient, chatClient,
                 loggerFactory.CreateLogger<CobolAnalyzerAgent>(),
                 settings.AISettings.CobolAnalyzerModelId,
-                enhancedLogger,
-                chatLogger,
-                settings: settings);
+                enhancedLogger, chatLogger, settings: settings);
 
-            // BusinessLogicExtractorAgent uses ResponsesApiClient (codex for RE reports)
-            // This ensures compatibility with gpt-5.2-chat which requires Responses API
-            var businessLogicExtractorAgent = new BusinessLogicExtractorAgent(
-                responsesApiClient,
+            var businessLogicExtractorAgent = BusinessLogicExtractorAgent.Create(
+                responsesApiClient, chatClient,
                 loggerFactory.CreateLogger<BusinessLogicExtractorAgent>(),
                 chatDeployment,
-                enhancedLogger,
-                chatLogger,
-                chunkingOrchestrator: chunkingOrchestrator,
-                settings: settings);
+                enhancedLogger, chatLogger,
+                chunkingOrchestrator: chunkingOrchestrator, settings: settings);
 
-            // DependencyMapperAgent uses ResponsesApiClient (codex for dependency analysis)
-            var dependencyMapperAgent = new DependencyMapperAgent(
-                responsesApiClient,
+            var dependencyMapperAgent = DependencyMapperAgent.Create(
+                responsesApiClient, chatClient,
                 loggerFactory.CreateLogger<DependencyMapperAgent>(),
                 settings.AISettings.DependencyMapperModelId ?? settings.AISettings.CobolAnalyzerModelId,
-                enhancedLogger,
-                chatLogger,
-                settings: settings);
+                enhancedLogger, chatLogger, settings: settings);
 
             // Smart routing: check for large files to decide between chunked vs direct RE
             var cobolFiles = await fileHelper.ScanDirectoryForCobolFilesAsync(settings.ApplicationSettings.CobolSourceFolder);

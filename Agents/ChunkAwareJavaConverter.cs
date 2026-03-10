@@ -39,6 +39,26 @@ public class ChunkAwareJavaConverter : AgentBase, IChunkAwareConverter
     }
 
     /// <summary>
+    /// Creates a ChunkAwareJavaConverter, routing to Responses API or Chat API based on availability.
+    /// </summary>
+    public static ChunkAwareJavaConverter Create(
+        ResponsesApiClient? responsesClient,
+        IChatClient? chatClient,
+        ILogger<ChunkAwareJavaConverter> logger,
+        string modelId,
+        ConversionSettings conversionSettings,
+        EnhancedLogger? enhancedLogger = null,
+        ChatLogger? chatLogger = null,
+        RateLimiter? rateLimiter = null,
+        AppSettings? settings = null,
+        int? runId = null)
+    {
+        return responsesClient != null
+            ? new ChunkAwareJavaConverter(responsesClient, logger, modelId, conversionSettings, enhancedLogger, chatLogger, rateLimiter, settings, runId)
+            : new ChunkAwareJavaConverter(chatClient!, logger, modelId, conversionSettings, enhancedLogger, chatLogger, rateLimiter, settings, runId);
+    }
+
+    /// <summary>
     /// Initializes a new instance using Responses API (for codex models like gpt-5.1-codex-mini).
     /// </summary>
     public ChunkAwareJavaConverter(

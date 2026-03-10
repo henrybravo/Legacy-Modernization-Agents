@@ -14,13 +14,15 @@ public class ChatLogger
     private readonly List<ChatMessage> _messages;
     private readonly object _lockObject = new object();
     private readonly string _sessionId;
+    private readonly string _providerName;
 
-    public ChatLogger(ILogger<ChatLogger> logger, string logDirectory = "Logs")
+    public ChatLogger(ILogger<ChatLogger> logger, string logDirectory = "Logs", string providerName = "Azure OpenAI")
     {
         _logger = logger;
         _logDirectory = logDirectory;
         _messages = new List<ChatMessage>();
         _sessionId = DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
+        _providerName = providerName;
         
         // Ensure log directory exists
         Directory.CreateDirectory(_logDirectory);
@@ -45,8 +47,8 @@ public class ChatLogger
             };
             
             _messages.Add(message);
-            _logger.LogInformation("Chat: {Agent} → Azure OpenAI for {File} ({Tokens} tokens)", 
-                agentName, fileName, message.TokenCount);
+            _logger.LogInformation("Chat: {Agent} → {Provider} for {File} ({Tokens} tokens)", 
+                agentName, _providerName, fileName, message.TokenCount);
         }
     }
 
@@ -68,8 +70,8 @@ public class ChatLogger
             };
             
             _messages.Add(message);
-            _logger.LogInformation("Chat: Azure OpenAI → {Agent} for {File} ({Tokens} tokens)", 
-                agentName, fileName, message.TokenCount);
+            _logger.LogInformation("Chat: {Provider} → {Agent} for {File} ({Tokens} tokens)", 
+                _providerName, agentName, fileName, message.TokenCount);
         }
     }
 
@@ -115,7 +117,7 @@ public class ChatLogger
         var sb = new StringBuilder();
         
         // Header
-        sb.AppendLine("# 🤖 Complete Azure OpenAI Chat Log");
+        sb.AppendLine($"# 🤖 Complete {_providerName} Chat Log");
         sb.AppendLine($"**Session ID:** {_sessionId}");
         sb.AppendLine($"**Generated:** {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} UTC");
         sb.AppendLine($"**Total Messages:** {_messages.Count}");
@@ -217,8 +219,7 @@ public class ChatLogger
     {
         if (string.IsNullOrEmpty(text)) return 0;
         
-        // Rough estimate: 1 token ≈ 4 characters for English text
-        // This is a simplified calculation - actual tokenization is more complex
+        // ~4 chars per token (rough estimate)
         return text.Length / 4;
     }
 

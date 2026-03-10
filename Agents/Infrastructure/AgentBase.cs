@@ -25,10 +25,10 @@ public abstract class AgentBase
     protected readonly AppSettings? Settings;
     protected readonly bool UseResponsesApi;
 
-    /// <summary>
-    /// Gets the name of the agent for logging purposes.
-    /// </summary>
     protected abstract string AgentName { get; }
+
+    protected string ProviderName =>
+        ChatClient is CopilotChatClient ? "GitHub Copilot" : "Azure OpenAI";
 
     /// <summary>
     /// Initializes a new instance using Chat Completions API (for chat models like gpt-5.1-chat).
@@ -95,7 +95,7 @@ public abstract class AgentBase
         // Log the request
         ChatLogger?.LogUserMessage(AgentName, contextIdentifier, userPrompt, systemPrompt);
         EnhancedLogger?.LogBehindTheScenes("API_CALL", UseResponsesApi ? "ResponsesAPI" : "ChatCompletion", 
-            $"Calling Azure OpenAI for {contextIdentifier}", AgentName);
+            $"Calling {ProviderName} for {contextIdentifier}", AgentName);
 
         try
         {
@@ -133,7 +133,7 @@ public abstract class AgentBase
             // Log the response
             ChatLogger?.LogAIResponse(AgentName, contextIdentifier, responseText);
             EnhancedLogger?.LogBehindTheScenes("API_RESPONSE", UseResponsesApi ? "ResponsesAPI" : "ChatCompletion", 
-                $"Received {responseText.Length} chars from Azure OpenAI", AgentName);
+                $"Received {responseText.Length} chars from {ProviderName}", AgentName);
 
             // Release rate limiter slot after completion
             RateLimiter?.ReleaseSlot();

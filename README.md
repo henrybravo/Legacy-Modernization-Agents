@@ -46,20 +46,22 @@ The migration uses Microsoft Agent Framework with a dual-API architecture (Respo
 |-------------|---------|-------|
 | **.NET SDK** | 10.0+ | [Download](https://dotnet.microsoft.com/download) |
 | **Docker Desktop** | Latest | Must be running for Neo4j |
-| **AI Endpoint** | — | Endpoint + API Key or via `az login` (see below) |
+| **AI Provider** | — | Azure OpenAI (endpoint + key or `az login`) **or** GitHub Copilot SDK (Copilot CLI) |
 
-### Supported LLMs
+### Supported AI Providers
 
-This project supports **two Azure OpenAI API types** with specific models:
+The framework supports two provider backends. All agents use the `IChatClient` abstraction; Azure OpenAI additionally supports the Responses API for codex models.
 
-| API Type | Model Example | Used For | Interface |
-|----------|---------------|----------|-----------|
-| **Responses API** | `gpt-5.1-codex-mini` | Code generation (agents) | `ResponsesApiClient` |
-| **Chat Completions API** | `gpt-5.1-chat` | Reports, portal chat | `IChatClient` |
+| Provider | API Types | Model Examples | Requirements |
+|----------|-----------|----------------|--------------------|
+| **Azure OpenAI** | Responses API + Chat Completions | `gpt-5.1-codex-mini`, `gpt-5.1-chat` | Endpoint + API key or `az login` |
+| **GitHub Copilot SDK** | Chat Completions (`CopilotChatClient`) | `claude-sonnet-4`, `gpt-5`, any Copilot-available model | Copilot CLI in PATH, `copilot login` |
+
+When using GitHub Copilot SDK, the `ResponsesApiClient` is not available — all agents fall back to `IChatClient` via `CopilotChatClient`. Set `AZURE_OPENAI_SERVICE_TYPE="GitHubCopilot"` in your config (or select it via `./doctor.sh setup`).
 
 > ⚠️ **Want to use different models?** You can swap models, but you may need to update API calls:
-> - Codex models → Responses API (`ResponsesApiClient`)
-> - Chat models → Chat Completions API (`IChatClient`)
+> - Codex models → Responses API (`ResponsesApiClient`) — Azure OpenAI only
+> - Chat models → Chat Completions API (`IChatClient`) — both providers
 > 
 > See [Agents/Infrastructure/](Agents/Infrastructure/) for API client implementations.
 
@@ -152,6 +154,8 @@ This project uses **Microsoft Agent Framework** (`Microsoft.Agents.AI.*`), **not
 
 ### Setup (2 minutes)
 
+#### Option A: Azure OpenAI
+
 ```bash
 # 1. Clone and enter
 git clone https://github.com/Azure-Samples/Legacy-Modernization-Agents.git
@@ -166,12 +170,42 @@ cp Config/ai-config.local.env.example Config/ai-config.local.env
 # 3. Start Neo4j (dependency graph storage)
 docker-compose up -d neo4j
 
-# 4. Build
+# 4. Build & run
 dotnet build
-
-# 5. Run migration but we recommend using the next section with doctor.sh run or portal for just loading the portal
 ./doctor.sh run
 ```
+
+#### Option B: GitHub Copilot SDK
+
+```bash
+# 1. Clone and enter
+git clone https://github.com/Azure-Samples/Legacy-Modernization-Agents.git
+cd Legacy-Modernization-Agents
+
+# 2. Interactive setup — select "GitHub Copilot SDK" when prompted
+./doctor.sh setup
+# Verifies Copilot CLI, authenticates, lets you pick chat & code models, writes config
+
+# 3. Start Neo4j (dependency graph storage)
+docker-compose up -d neo4j
+
+# 4. Build & run
+dotnet build
+./doctor.sh run
+```
+
+The setup wizard walks you through the following steps:
+
+1. **Provider selection** — choose "GitHub Copilot SDK"
+2. **Authentication** — pick one of two methods:
+   | Method | How it works |
+   |--------|-------------|
+   | **GitHub CLI** (default) | Runs `copilot login` interactively — no token to manage |
+   | **Personal Access Token (PAT)** | Provide a classic PAT with the `copilot` scope. Create one at [github.com/settings/tokens](https://github.com/settings/tokens). Fine-grained PATs do **not** support Copilot. |
+3. **Chat model** — select the model used for analysis, reasoning, and reverse engineering
+4. **Code model** — optionally pick a different model optimized for code generation, or reuse the chat model
+
+The wizard writes `Config/ai-config.local.env` with `AZURE_OPENAI_SERVICE_TYPE="GitHubCopilot"` and your chosen models.
 
 ---
 
@@ -253,7 +287,7 @@ The speed profile works by setting environment variables that override the three
 ```bash
 ./doctor.sh               # Health check - verify configuration
 ./doctor.sh test          # Run system tests
-./doctor.sh setup         # Interactive setup wizard
+./doctor.sh setup         # Interactive setup wizard (Azure OpenAI or GitHub Copilot SDK)
 ./doctor.sh chunking-health  # Check smart chunking configuration
 ```
 
@@ -961,6 +995,7 @@ The `load-config.sh` script:
 
 | Setting | appsettings.json Location | .env Override |
 |---------|---------------------------|---------------|
+| Service type | `AISettings.ServiceType` | `AZURE_OPENAI_SERVICE_TYPE` |
 | Codex model | `AISettings.ModelId` | `_CODE_MODEL` |
 | Chat model | `AISettings.ChatModelId` | `_CHAT_MODEL` |
 | API endpoint | `AISettings.Endpoint` | `_MAIN_ENDPOINT` |
@@ -972,7 +1007,7 @@ The `load-config.sh` script:
 
 ---
 
-### Required: Azure OpenAI
+### Provider: Azure OpenAI
 
 In `Config/ai-config.local.env`:
 ```bash
@@ -988,6 +1023,21 @@ _CODE_MODEL="gpt-5.1-codex-mini"     # For Code Conversion
 > 💡 **Prefer keyless auth?** Run `az login` and leave `_MAIN_API_KEY` empty.
 > You need the **"Cognitive Services OpenAI User"** role on your Azure OpenAI resource.
 > See [Azure AD / Entra ID Authentication Guide](azlogin-auth-guide.md) for full instructions.
+
+### Provider: GitHub Copilot SDK
+
+Run `./doctor.sh setup` and select **GitHub Copilot SDK**, or create `Config/ai-config.local.env` manually:
+
+```bash
+AZURE_OPENAI_SERVICE_TYPE="GitHubCopilot"
+_CHAT_MODEL="claude-sonnet-4"    # Any model available to your Copilot plan
+_CODE_MODEL="claude-sonnet-4"
+```
+
+Requirements:
+- **Copilot CLI** installed and in `PATH` (`npm install -g @github/copilot@latest`)
+- Authenticated via `copilot login`
+- Endpoint and API key settings are ignored in this mode
 
 ### Neo4j (Dependency Graphs)
 

@@ -27,6 +27,27 @@ public class CobolAnalyzerAgent : ICobolAnalyzerAgent
 
     private string AgentName => "CobolAnalyzerAgent";
 
+    private string ProviderName =>
+        _chatClient is CopilotChatClient ? "GitHub Copilot" : "Azure OpenAI";
+
+    /// <summary>
+    /// Creates a CobolAnalyzerAgent, routing to Responses API or Chat API based on availability.
+    /// </summary>
+    public static CobolAnalyzerAgent Create(
+        ResponsesApiClient? responsesClient,
+        IChatClient? chatClient,
+        ILogger<CobolAnalyzerAgent> logger,
+        string modelId,
+        EnhancedLogger? enhancedLogger = null,
+        ChatLogger? chatLogger = null,
+        RateLimiter? rateLimiter = null,
+        AppSettings? settings = null)
+    {
+        return responsesClient != null
+            ? new CobolAnalyzerAgent(responsesClient, logger, modelId, enhancedLogger, chatLogger, rateLimiter, settings)
+            : new CobolAnalyzerAgent(chatClient!, logger, modelId, enhancedLogger, chatLogger, rateLimiter, settings);
+    }
+
     /// <summary>
     /// Initializes a new instance using Responses API (for codex models).
     /// </summary>
@@ -276,14 +297,14 @@ public class CobolAnalyzerAgent : ICobolAnalyzerAgent
                 if (_useResponsesApi && _responsesClient != null)
                 {
                     _enhancedLogger?.LogBehindTheScenes("API_CALL", "ResponsesAPI",
-                        $"Calling Azure OpenAI Responses API for {contextIdentifier}", AgentName);
+                        $"Calling {ProviderName} Responses API for {contextIdentifier}", AgentName);
                     // Use auto-optimized token settings based on input size
                     response = await _responsesClient.GetResponseAutoAsync(systemPrompt, userPrompt);
                 }
                 else if (_chatClient != null)
                 {
                     _enhancedLogger?.LogBehindTheScenes("API_CALL", "ChatCompletion",
-                        $"Calling Azure OpenAI Chat API for {contextIdentifier}", AgentName);
+                        $"Calling {ProviderName} Chat API for {contextIdentifier}", AgentName);
                     
                     var messages = new List<Microsoft.Extensions.AI.ChatMessage>
                     {
@@ -309,7 +330,7 @@ public class CobolAnalyzerAgent : ICobolAnalyzerAgent
                 // Log the response
                 _chatLogger?.LogAIResponse(AgentName, contextIdentifier, response);
                 _enhancedLogger?.LogBehindTheScenes("API_RESPONSE", _useResponsesApi ? "ResponsesAPI" : "ChatCompletion",
-                    $"Received {response.Length} chars from Azure OpenAI", AgentName);
+                    $"Received {response.Length} chars from {ProviderName}", AgentName);
 
                 _rateLimiter?.ReleaseSlot();
                 return (response, false, null);
