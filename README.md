@@ -18,6 +18,7 @@ The migration uses Microsoft Agent Framework with a dual-API architecture (Respo
 > |---|---|
 > | `./doctor.sh run` | **Run a full migration** — analyze COBOL, convert to Java/C#, generate reports, and launch the portal |
 > | `./doctor.sh reverse-eng` | **Extract business logic only** — runs RE analysis, persists results to DB, launches the portal |
+> | `./doctor.sh cscm` | **COBOL Safe Code Modification** — modify COBOL in place (analysis + deps + change proposal + patch), launches the portal |
 > | `./doctor.sh convert-only` | **Convert only** — skips RE; prompts whether to inject persisted RE results from a previous run |
 > | `./doctor.sh portal` | **Open the portal only** — browse previous migration results, dependency graphs, and chat with your codebase at http://localhost:5028 |
 >
@@ -219,6 +220,7 @@ The wizard writes `Config/ai-config.local.env` with `AZURE_OPENAI_SERVICE_TYPE="
 ./doctor.sh run           # Full migration: analyze → convert → launch portal
 ./doctor.sh portal        # Launch web portal only (http://localhost:5028)
 ./doctor.sh reverse-eng   # Extract business logic, persist to DB, launch portal
+./doctor.sh cscm          # COBOL Safe Code Modification: analyze → deps → proposal → patch + portal
 ./doctor.sh convert-only  # Conversion only; prompts to reuse persisted RE context
 ```
 
@@ -785,6 +787,12 @@ flowchart TD
       OUTPUT["Output Files"]
   end
 
+  subgraph CSCM_PHASE["PHASE 3 alt: CSCM"]
+      PROPOSER["ChangeProposalAgent\n(Paragraph-level edits)"]
+      PATCHER["PatchApplier\n(Deterministic)"]
+      CSCM_OUT["Patched COBOL + Diff"]
+  end
+
   CLI --> REGEX
   REGEX --> SQLITE
   REGEX --> ANALYZE_PHASE
@@ -798,6 +806,11 @@ flowchart TD
   NEO4J --> FETCHER
   FETCHER --> CONVERTER
   CONVERTER --> OUTPUT
+
+  SQLITE --> PROPOSER
+  NEO4J --> PROPOSER
+  PROPOSER --> PATCHER
+  PATCHER --> CSCM_OUT
 ```
 
 ### 🔀 Agent Responsibilities & Interactions

@@ -8,6 +8,7 @@ using CobolToQuarkusMigration.Mcp;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging;
 using System.CommandLine;
+using System.CommandLine.Invocation;
 using GitHub.Copilot.SDK;
 using Microsoft.Extensions.Logging.Console;
 
@@ -143,6 +144,9 @@ internal static class Program
         var listModelsCommand = BuildListModelsCommand();
         rootCommand.AddCommand(listModelsCommand);
 
+        var cscmCommand = BuildCscmCommand(loggerFactory, fileHelper, settingsHelper);
+        rootCommand.AddCommand(cscmCommand);
+
         rootCommand.SetHandler(async (string cobolSource, string javaOutput, string reverseEngineerOutput, bool reverseEngineerOnly, bool skipReverseEngineering, bool reuseRe, string configPath, bool resume) =>
         {
             await RunMigrationAsync(loggerFactory, logger, fileHelper, settingsHelper, cobolSource, javaOutput, reverseEngineerOutput, reverseEngineerOnly, skipReverseEngineering, reuseRe, configPath, resume);
@@ -167,6 +171,300 @@ internal static class Program
         });
 
         return listModelsCommand;
+    }
+
+    private static Command BuildCscmCommand(ILoggerFactory loggerFactory, FileHelper fileHelper, SettingsHelper settingsHelper)
+    {
+        var cscmCommand = new Command("cscm", "COBOL Safe Code Modification — propose and apply targeted, safe COBOL code changes");
+
+        var sourceOption = new Option<string>("--source", "Path to the folder containing COBOL source files")
+        {
+            Arity = ArgumentArity.ExactlyOne
+        };
+        sourceOption.AddAlias("-s");
+        cscmCommand.AddOption(sourceOption);
+
+        var targetFileOption = new Option<string>("--target-file", "The COBOL file name to modify (e.g. PAYROLL.cbl)")
+        {
+            Arity = ArgumentArity.ExactlyOne
+        };
+        targetFileOption.AddAlias("-t");
+        cscmCommand.AddOption(targetFileOption);
+
+        var changeTypeOption = new Option<string>("--change-type", () => "BugFix",
+            "Type of change: BugFix, LogicUpdate, CompliancePatch, Performance")
+        {
+            Arity = ArgumentArity.ZeroOrOne
+        };
+        changeTypeOption.AddAlias("-ct");
+        cscmCommand.AddOption(changeTypeOption);
+
+        var scopeOption = new Option<string[]>("--scope", "Paragraph/section names allowed to be modified (repeatable)")
+        {
+            Arity = ArgumentArity.OneOrMore,
+            AllowMultipleArgumentsPerToken = true
+        };
+        scopeOption.AddAlias("-sc");
+        cscmCommand.AddOption(scopeOption);
+
+        var rationaleOption = new Option<string>("--rationale", "Free-text description of why this change is needed")
+        {
+            Arity = ArgumentArity.ExactlyOne
+        };
+        rationaleOption.AddAlias("-r");
+        cscmCommand.AddOption(rationaleOption);
+
+        var outputOption = new Option<string>("--output", () => "output/cscm", "Path to the output folder for patched files")
+        {
+            Arity = ArgumentArity.ZeroOrOne
+        };
+        outputOption.AddAlias("-o");
+        cscmCommand.AddOption(outputOption);
+
+        var configOption = new Option<string>("--config", () => "Config/appsettings.json", "Path to the configuration file")
+        {
+            Arity = ArgumentArity.ZeroOrOne
+        };
+        configOption.AddAlias("-c");
+        cscmCommand.AddOption(configOption);
+
+        var autoApproveOption = new Option<bool>("--auto-approve-low-risk", () => false,
+            "Automatically approve and apply proposals with RiskLevel = Low")
+        {
+            Arity = ArgumentArity.ZeroOrOne
+        };
+        cscmCommand.AddOption(autoApproveOption);
+
+        var proposeOnlyOption = new Option<bool>("--propose-only", () => false,
+            "Run steps 1-3 only (Analyze → Dependencies → Proposal). Skip patch application.")
+        {
+            Arity = ArgumentArity.ZeroOrOne
+        };
+        cscmCommand.AddOption(proposeOnlyOption);
+
+        cscmCommand.SetHandler(async (InvocationContext ctx) =>
+        {
+            await RunCscmAsync(loggerFactory, fileHelper, settingsHelper,
+                ctx.ParseResult.GetValueForOption(sourceOption)!,
+                ctx.ParseResult.GetValueForOption(targetFileOption)!,
+                ctx.ParseResult.GetValueForOption(changeTypeOption)!,
+                ctx.ParseResult.GetValueForOption(scopeOption)!,
+                ctx.ParseResult.GetValueForOption(rationaleOption)!,
+                ctx.ParseResult.GetValueForOption(outputOption)!,
+                ctx.ParseResult.GetValueForOption(configOption)!,
+                ctx.ParseResult.GetValueForOption(autoApproveOption),
+                ctx.ParseResult.GetValueForOption(proposeOnlyOption));
+        });
+
+        return cscmCommand;
+    }
+
+    private static async Task RunCscmAsync(
+        ILoggerFactory loggerFactory,
+        FileHelper fileHelper,
+        SettingsHelper settingsHelper,
+        string cobolSource,
+        string targetFile,
+        string changeType,
+        string[] scope,
+        string rationale,
+        string output,
+        string configPath,
+        bool autoApproveLowRisk,
+        bool proposeOnly = false)
+    {
+        var logger = loggerFactory.CreateLogger("CSCM");
+
+        try
+        {
+            logger.LogInformation("Loading settings from {ConfigPath}", configPath);
+            AppSettings? loadedSettings = await settingsHelper.LoadSettingsAsync<AppSettings>(configPath);
+            var settings = loadedSettings ?? new AppSettings();
+
+            LoadEnvironmentVariables();
+            OverrideSettingsFromEnvironment(settings);
+
+            // Parse change type
+            if (!Enum.TryParse<ChangeType>(changeType, true, out var parsedChangeType))
+            {
+                Console.WriteLine($"❌ Invalid change type: {changeType}. Valid values: BugFix, LogicUpdate, CompliancePatch, Performance");
+                Environment.Exit(1);
+            }
+
+            // Build change request
+            var changeRequest = new ChangeRequest
+            {
+                TargetFile = targetFile,
+                ChangeType = parsedChangeType,
+                Scope = scope.ToList(),
+                Rationale = rationale
+            };
+
+            // Initialize repository
+            var databasePath = settings.ApplicationSettings.MigrationDatabasePath ?? "Data/migration.db";
+            if (!Path.IsPathRooted(databasePath))
+                databasePath = Path.GetFullPath(databasePath);
+
+            var repositoryLogger = loggerFactory.CreateLogger<SqliteMigrationRepository>();
+            var migrationRepository = new SqliteMigrationRepository(databasePath, repositoryLogger);
+            await migrationRepository.InitializeAsync();
+
+            // Override source folder
+            if (!string.IsNullOrEmpty(cobolSource))
+                settings.ApplicationSettings.CobolSourceFolder = cobolSource;
+
+            if (string.IsNullOrEmpty(settings.ApplicationSettings.CobolSourceFolder))
+            {
+                logger.LogError("COBOL source folder not specified. Use --source option.");
+                Environment.Exit(1);
+            }
+
+            // Validate AI configuration
+            if (!IsGitHubCopilotMode(settings.AISettings))
+            {
+                if (string.IsNullOrEmpty(settings.AISettings.Endpoint) ||
+                    string.IsNullOrEmpty(settings.AISettings.DeploymentName))
+                {
+                    logger.LogError("Azure OpenAI configuration incomplete.");
+                    Environment.Exit(1);
+                }
+            }
+
+            // Create loggers
+            var enhancedLogger = new EnhancedLogger(loggerFactory.CreateLogger<EnhancedLogger>());
+            var providerName = IsGitHubCopilotMode(settings.AISettings) ? "GitHub Copilot" : "Azure OpenAI";
+            var chatLogger = new ChatLogger(loggerFactory.CreateLogger<ChatLogger>(), providerName: providerName);
+
+            // Create API clients
+            var apiVersion = Environment.GetEnvironmentVariable("AZURE_OPENAI_API_VERSION") ?? "2025-04-01-preview";
+            ResponsesApiClient? responsesApiClient = null;
+            if (!IsGitHubCopilotMode(settings.AISettings))
+            {
+                responsesApiClient = new ResponsesApiClient(
+                    settings.AISettings.Endpoint,
+                    string.Empty,
+                    settings.AISettings.DeploymentName,
+                    loggerFactory.CreateLogger<ResponsesApiClient>(),
+                    enhancedLogger,
+                    profile: settings.CodexProfile,
+                    apiVersion: apiVersion,
+                    rateLimitSafetyFactor: settings.ChunkingSettings.RateLimitSafetyFactor);
+            }
+
+            var chatDeployment = settings.AISettings.ChatDeploymentName ?? settings.AISettings.DeploymentName;
+            IChatClient chatClient = CreateChatClientFromSettings(settings.AISettings, logger, forChat: true);
+
+            ConfigureSmartChunking(settings, chatDeployment, logger);
+
+            // Create agents
+            var cobolAnalyzerAgent = CobolAnalyzerAgent.Create(
+                responsesApiClient, chatClient,
+                loggerFactory.CreateLogger<CobolAnalyzerAgent>(),
+                settings.AISettings.CobolAnalyzerModelId,
+                enhancedLogger, chatLogger, settings: settings);
+
+            var changeProposalAgent = ChangeProposalAgent.Create(
+                responsesApiClient, chatClient,
+                loggerFactory.CreateLogger<ChangeProposalAgent>(),
+                settings.AISettings.CobolAnalyzerModelId,
+                enhancedLogger, chatLogger, settings: settings);
+
+            var dependencyMapperAgent = DependencyMapperAgent.Create(
+                responsesApiClient, chatClient,
+                loggerFactory.CreateLogger<DependencyMapperAgent>(),
+                settings.AISettings.DependencyMapperModelId ?? settings.AISettings.CobolAnalyzerModelId,
+                enhancedLogger, chatLogger, settings: settings);
+
+            var patchApplier = new PatchApplier(loggerFactory.CreateLogger<PatchApplier>());
+
+            // Build hybrid repository
+            Neo4jMigrationRepository? neo4jRepo = null;
+            if (settings.ApplicationSettings.Neo4j?.Enabled == true)
+            {
+                try
+                {
+                    var driver = Neo4jMigrationRepository.CreateResilientDriver(
+                        settings.ApplicationSettings.Neo4j.Uri,
+                        settings.ApplicationSettings.Neo4j.Username,
+                        settings.ApplicationSettings.Neo4j.Password);
+                    neo4jRepo = new Neo4jMigrationRepository(driver, loggerFactory.CreateLogger<Neo4jMigrationRepository>());
+                }
+                catch (Exception ex)
+                {
+                    logger.LogWarning(ex, "Neo4j initialization failed — proceeding without graph database");
+                }
+            }
+
+            var hybridRepo = new HybridMigrationRepository(
+                migrationRepository, neo4jRepo, loggerFactory.CreateLogger<HybridMigrationRepository>());
+            await hybridRepo.InitializeAsync();
+
+            // Run CSCM process
+            var cscmProcess = new CscmProcess(
+                cobolAnalyzerAgent,
+                changeProposalAgent,
+                dependencyMapperAgent,
+                fileHelper,
+                patchApplier,
+                loggerFactory.CreateLogger<CscmProcess>(),
+                enhancedLogger,
+                settings,
+                hybridRepo);
+
+            var result = await cscmProcess.RunAsync(
+                changeRequest,
+                settings.ApplicationSettings.CobolSourceFolder,
+                output,
+                autoApproveLowRisk,
+                proposeOnly: proposeOnly,
+                progressCallback: (status, current, total) => Console.WriteLine($"{status} - {current}/{total}"));
+
+            // Print summary
+            Console.WriteLine();
+            Console.WriteLine("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+            Console.WriteLine("✨ COBOL Safe Code Modification Complete!");
+            Console.WriteLine("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+            Console.WriteLine();
+            Console.WriteLine($"📊 Summary:");
+            Console.WriteLine($"   • Target: {result.TargetFile}");
+            Console.WriteLine($"   • Changes proposed: {result.Proposal?.AffectedParagraphs.Count ?? 0}");
+            Console.WriteLine($"   • Risk level: {result.Proposal?.RiskLevel}");
+            Console.WriteLine($"   • Approval state: {result.Proposal?.ApprovalState}");
+            Console.WriteLine($"   • Patch applied: {result.PatchApplied}");
+            Console.WriteLine();
+
+            if (result.PatchedFilePath != null)
+            {
+                Console.WriteLine($"📁 Output:");
+                Console.WriteLine($"   • Patched file: {Path.GetFullPath(result.PatchedFilePath)}");
+                if (result.DiffFilePath != null)
+                    Console.WriteLine($"   • Diff file: {Path.GetFullPath(result.DiffFilePath)}");
+            }
+            else if (result.Diffs.Count > 0)
+            {
+                if (proposeOnly)
+                {
+                    Console.WriteLine("📋 Propose-only mode: diffs generated and persisted to database.");
+                    Console.WriteLine("   To apply, re-run without --propose-only (optionally with --auto-approve-low-risk).");
+                }
+                else
+                {
+                    Console.WriteLine("📋 Diffs generated but not applied (pending review).");
+                    Console.WriteLine("   Run with --auto-approve-low-risk or approve via the portal.");
+                }
+            }
+
+            Console.WriteLine();
+            Console.WriteLine("💡 To review results in the portal:");
+            Console.WriteLine("   • Use ./doctor.sh portal    (launches portal at http://localhost:5028)");
+            Console.WriteLine("   • Or: dotnet run --project McpChatWeb");
+            Console.WriteLine();
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Error during CSCM");
+            Environment.Exit(1);
+        }
     }
 
     private static Command BuildConversationCommand(ILoggerFactory loggerFactory)

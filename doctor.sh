@@ -86,6 +86,7 @@ show_usage() {
     echo -e "  ${GREEN}portal${NC}          Start the web portal (documentation & monitoring)"
     echo -e "  ${GREEN}doctor${NC}          Diagnose configuration issues (default)"
     echo -e "  ${GREEN}reverse-eng${NC}     Run reverse engineering analysis only (no conversion) + Portal"
+    echo -e "  ${GREEN}cscm${NC}            COBOL Safe Code Modification — modify COBOL in place + Portal"
     echo -e "  ${GREEN}resume${NC}          Resume interrupted migration"
     echo -e "  ${GREEN}monitor${NC}         Monitor migration progress"
     echo -e "  ${GREEN}chunking-health${NC} Check smart chunking infrastructure"
@@ -97,6 +98,7 @@ show_usage() {
     echo -e "  $0 setup             ${CYAN}# Interactive setup${NC}"
     echo -e "  $0 test              ${CYAN}# Test configuration and dependencies${NC}"
     echo -e "  $0 reverse-eng       ${CYAN}# Extract business logic only (no conversion) + Portal${NC}"
+    echo -e "  $0 cscm              ${CYAN}# Modify COBOL in place (analysis + deps + proposal) + Portal${NC}"
     echo -e "  $0 run               ${CYAN}# Full migration (auto-chunks large files)${NC}"
     echo -e "  $0 portal            ${CYAN}# Start portal to view docs & reports${NC}"
     echo -e "  $0 convert-only      ${CYAN}# Conversion only (prompts to reuse cached RE results) + UI${NC}"
@@ -2172,6 +2174,191 @@ run_reverse_engineering() {
     return $exit_code
 }
 
+# Function to run COBOL Safe Code Modification (CSCM)
+run_cscm() {
+    echo -e "${BLUE}🔧 COBOL Safe Code Modification (CSCM)${NC}"
+    echo "========================================"
+    echo ""
+
+    # Mode selection
+    echo -e "${BOLD}Pipeline mode:${NC}"
+    echo -e "  [${GREEN}1${NC}] Propose only  — Analyze → Dependencies → Proposal  (review before patching)"
+    echo -e "  [${GREEN}2${NC}] Full pipeline  — Analyze → Dependencies → Proposal → Patch"
+    echo ""
+    read -rp "Select mode (1-2) [default: 1]: " mode_choice
+    mode_choice="${mode_choice:-1}"
+    local propose_only_flag=""
+    case "$mode_choice" in
+        1) propose_only_flag="--propose-only"
+           echo -e "Mode: ${GREEN}Propose only${NC} (steps 1-3, no patch)" ;;
+        2) echo -e "Mode: ${GREEN}Full pipeline${NC} (steps 1-4)" ;;
+        *) echo -e "${RED}❌ Invalid selection.${NC}"; return 1 ;;
+    esac
+    echo ""
+
+    echo "Modify COBOL source code in-place — no transpilation."
+    echo ""
+
+    echo -e "${BLUE}Using dotnet CLI:${NC} $DOTNET_CMD"
+
+    # Load configuration
+    echo "🔧 Loading AI configuration..."
+    if ! load_configuration; then
+        echo -e "${RED}❌ Configuration loading failed. Please run: ./doctor.sh setup${NC}"
+        return 1
+    fi
+
+    if ! load_ai_config; then
+        echo -e "${RED}❌ Configuration loading failed. Please check your ai-config.local.env file.${NC}"
+        return 1
+    fi
+
+    if ! check_ai_connectivity; then
+        echo -e "${RED}❌ Please fix connection issues first.${NC}"
+        return 1
+    fi
+
+    # Check for COBOL files
+    local cobol_files=()
+    while IFS= read -r -d '' file; do
+        cobol_files+=("$(basename "$file")")
+    done < <(find "$REPO_ROOT/source" -name "*.cbl" -print0 2>/dev/null)
+
+    if [ ${#cobol_files[@]} -eq 0 ]; then
+        echo -e "${YELLOW}⚠️  No COBOL files found in ./source/${NC}"
+        echo "Add .cbl files to analyze and try again."
+        return 1
+    fi
+
+    # Prompt: target file
+    echo -e "${BOLD}Available COBOL files:${NC}"
+    local i=1
+    for f in "${cobol_files[@]}"; do
+        echo -e "  [${GREEN}$i${NC}] $f"
+        i=$((i + 1))
+    done
+    echo ""
+    read -rp "Select target file (1-${#cobol_files[@]}): " file_choice
+    if ! [[ "$file_choice" =~ ^[0-9]+$ ]] || [ "$file_choice" -lt 1 ] || [ "$file_choice" -gt ${#cobol_files[@]} ]; then
+        echo -e "${RED}❌ Invalid selection.${NC}"
+        return 1
+    fi
+    local target_file="${cobol_files[$((file_choice - 1))]}"
+    echo -e "Target: ${GREEN}$target_file${NC}"
+    echo ""
+
+    # Prompt: change type
+    echo -e "${BOLD}Change type:${NC}"
+    echo -e "  [${GREEN}1${NC}] BugFix"
+    echo -e "  [${GREEN}2${NC}] LogicUpdate"
+    echo -e "  [${GREEN}3${NC}] CompliancePatch"
+    echo -e "  [${GREEN}4${NC}] Performance"
+    echo ""
+    read -rp "Select change type (1-4) [default: 1]: " ct_choice
+    ct_choice="${ct_choice:-1}"
+    case "$ct_choice" in
+        1) local change_type="BugFix" ;;
+        2) local change_type="LogicUpdate" ;;
+        3) local change_type="CompliancePatch" ;;
+        4) local change_type="Performance" ;;
+        *) echo -e "${RED}❌ Invalid selection.${NC}"; return 1 ;;
+    esac
+    echo -e "Change type: ${GREEN}$change_type${NC}"
+    echo ""
+
+    # Prompt: scope (paragraph names)
+    echo -e "${BOLD}Scope — paragraph/section names allowed to be modified${NC}"
+    echo "Enter one or more names separated by spaces."
+    read -rp "Scope: " scope_input
+    if [ -z "$scope_input" ]; then
+        echo -e "${RED}❌ Scope is required.${NC}"
+        return 1
+    fi
+    echo -e "Scope: ${GREEN}$scope_input${NC}"
+    echo ""
+
+    # Prompt: rationale
+    echo -e "${BOLD}Rationale — why is this change needed?${NC}"
+    read -rp "Rationale: " rationale_input
+    if [ -z "$rationale_input" ]; then
+        echo -e "${RED}❌ Rationale is required.${NC}"
+        return 1
+    fi
+    echo ""
+
+    # Prompt: auto-approve low risk (only relevant for full pipeline mode)
+    local auto_approve_flag=""
+    if [ -z "$propose_only_flag" ]; then
+        read -rp "Auto-approve low-risk changes? (y/N): " auto_approve_choice
+        if [[ "$auto_approve_choice" =~ ^[Yy]$ ]]; then
+            auto_approve_flag="--auto-approve-low-risk"
+        fi
+    fi
+
+    # Select speed profile
+    select_speed_profile
+
+    echo ""
+    echo "🔧 Starting CSCM Pipeline..."
+    echo "=========================================="
+    echo "  Target:      $target_file"
+    echo "  Change type: $change_type"
+    echo "  Scope:       $scope_input"
+    echo "  Rationale:   $rationale_input"
+    echo "=========================================="
+    echo ""
+
+    # Launch portal in background for monitoring
+    launch_portal_background
+
+    # Build scope args (each word becomes a separate --scope argument)
+    local scope_args=()
+    for s in $scope_input; do
+        scope_args+=(--scope "$s")
+    done
+
+    # Run the CSCM command
+    export MIGRATION_DB_PATH="$REPO_ROOT/Data/migration.db"
+    "$DOTNET_CMD" run cscm \
+        --source ./source \
+        --target-file "$target_file" \
+        --change-type "$change_type" \
+        "${scope_args[@]}" \
+        --rationale "$rationale_input" \
+        --output ./output/cscm \
+        $auto_approve_flag $propose_only_flag
+
+    local exit_code=$?
+
+    if [ $exit_code -eq 0 ]; then
+        echo ""
+        echo -e "${GREEN}✅ CSCM completed successfully!${NC}"
+        echo ""
+        echo "Output files in: ./output/cscm/"
+        echo "  • Patched COBOL file (if approved)"
+        echo "  • Unified diff for review"
+        echo "  • Results persisted to database"
+        echo ""
+        echo -e "${CYAN}📄 View in Portal:${NC}"
+        echo "  • Portal running at: http://localhost:5028"
+        echo "  • Review proposals, diffs, and approval state"
+        echo ""
+        echo -e "${CYAN}Portal is running. Press Ctrl+C to stop.${NC}"
+
+        if [ -n "$PORTAL_PID" ]; then
+            wait $PORTAL_PID 2>/dev/null
+        fi
+    else
+        echo ""
+        echo -e "${RED}❌ CSCM failed (exit code $exit_code)${NC}"
+        if [ -n "$PORTAL_PID" ]; then
+            echo -e "${YELLOW}Portal is still running at http://localhost:5028 for debugging${NC}"
+        fi
+    fi
+
+    return $exit_code
+}
+
 # Function to run conversion-only (skip reverse engineering)
 run_conversion_only() {
     echo -e "${BLUE}🔄 Starting COBOL to Java Conversion (Skip Reverse Engineering)${NC}"
@@ -2321,6 +2508,9 @@ main() {
             ;;
         "reverse-eng"|"reverse-engineer"|"reverse")
             run_reverse_engineering
+            ;;
+        "cscm"|"safe-mod")
+            run_cscm
             ;;
         "resume")
             run_resume
