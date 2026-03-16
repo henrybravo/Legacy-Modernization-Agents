@@ -296,7 +296,40 @@ CREATE TABLE IF NOT EXISTS business_logic (
     FOREIGN KEY(run_id) REFERENCES runs(id) ON DELETE CASCADE,
     UNIQUE(run_id, file_name)
 );
-CREATE INDEX IF NOT EXISTS idx_business_logic_run ON business_logic(run_id);";
+CREATE INDEX IF NOT EXISTS idx_business_logic_run ON business_logic(run_id);
+
+-- CSCM (COBOL Safe Code Modification) tables
+CREATE TABLE IF NOT EXISTS cscm_proposals (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id           INTEGER NOT NULL,
+    source_file      TEXT NOT NULL,
+    change_type      TEXT NOT NULL,
+    requested_scope  TEXT NOT NULL,
+    rationale        TEXT NOT NULL,
+    affected_paragraphs TEXT NOT NULL,
+    risk_level       TEXT NOT NULL,
+    approval_state   TEXT NOT NULL DEFAULT 'Pending',
+    approved_by      TEXT,
+    approved_at      TEXT,
+    model_used       TEXT NOT NULL,
+    created_at       TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(run_id) REFERENCES runs(id),
+    UNIQUE(run_id, source_file, change_type, created_at)
+);
+
+CREATE TABLE IF NOT EXISTS cscm_diffs (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    proposal_id      INTEGER NOT NULL,
+    paragraph_name   TEXT NOT NULL,
+    original_text    TEXT NOT NULL,
+    proposed_text    TEXT NOT NULL,
+    unified_diff     TEXT NOT NULL,
+    patch_applied    INTEGER NOT NULL DEFAULT 0,
+    applied_at       TEXT,
+    revert_snapshot  TEXT,
+    FOREIGN KEY(proposal_id) REFERENCES cscm_proposals(id)
+);
+CREATE INDEX IF NOT EXISTS idx_cscm_diffs_proposal ON cscm_diffs(proposal_id);";
         await command.ExecuteNonQueryAsync(cancellationToken);
         _logger.LogInformation("SQLite database ready at {DatabasePath}", _databasePath);
     }
